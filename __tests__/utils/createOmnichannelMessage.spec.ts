@@ -249,6 +249,114 @@ describe('createOmnichannelMessage', () => {
         });
     });
 
+    it('createOmnichannelMessage with LiveChatV2 message with type:"html" (REST rehydrate path) should propagate contentType', () => {
+        const sampleMessage = {
+            id: 'id',
+            type: 'html',
+            content: '<strong>hey</strong>',
+            metadata: { tags: 'tags' },
+            sender: {
+                communicationUserId: 'id',
+                kind: "communicationUser"
+            },
+            senderDisplayName: 'senderDisplayName',
+            createdOn: 'createdOn'
+        };
+
+        const omnichannelMessage = createOmnichannelMessage(sampleMessage as any, {
+            liveChatVersion: LiveChatVersion.V2
+        });
+
+        expect(omnichannelMessage.contentType).toBe('html');
+        expect(omnichannelMessage.content).toBe(sampleMessage.content);
+    });
+
+    it('createOmnichannelMessage with LiveChatV2 message with type:"RichText/Html" (WS signaling event) should normalize to "html"', () => {
+        // ChatMessageReceivedEvent / ChatMessageEditedEvent deliver `type` as
+        // 'RichText/Html' over the WebSocket, whereas the REST rehydrate path
+        // returns 'html'. Normalize so consumers see one contract.
+        const sampleMessage = {
+            id: 'id',
+            type: 'RichText/Html',
+            content: '<strong>hey</strong>',
+            metadata: { tags: 'tags' },
+            sender: {
+                communicationUserId: 'id',
+                kind: "communicationUser"
+            },
+            senderDisplayName: 'senderDisplayName',
+            createdOn: 'createdOn'
+        };
+
+        const omnichannelMessage = createOmnichannelMessage(sampleMessage as any, {
+            liveChatVersion: LiveChatVersion.V2
+        });
+
+        expect(omnichannelMessage.contentType).toBe('html');
+    });
+
+    it('createOmnichannelMessage with LiveChatV2 message with type:"text" should propagate contentType', () => {
+        const sampleMessage = {
+            id: 'id',
+            type: 'text',
+            content: 'plain text',
+            metadata: { tags: 'tags' },
+            sender: {
+                communicationUserId: 'id',
+                kind: "communicationUser"
+            },
+            senderDisplayName: 'senderDisplayName',
+            createdOn: 'createdOn'
+        };
+
+        const omnichannelMessage = createOmnichannelMessage(sampleMessage as any, {
+            liveChatVersion: LiveChatVersion.V2
+        });
+
+        expect(omnichannelMessage.contentType).toBe('text');
+    });
+
+    it('createOmnichannelMessage with LiveChatV2 message with type:"Text" (WS signaling event) should normalize to "text"', () => {
+        const sampleMessage = {
+            id: 'id',
+            type: 'Text',
+            content: 'plain',
+            metadata: { tags: 'tags' },
+            sender: {
+                communicationUserId: 'id',
+                kind: "communicationUser"
+            },
+            senderDisplayName: 'senderDisplayName',
+            createdOn: 'createdOn'
+        };
+
+        const omnichannelMessage = createOmnichannelMessage(sampleMessage as any, {
+            liveChatVersion: LiveChatVersion.V2
+        });
+
+        expect(omnichannelMessage.contentType).toBe('text');
+    });
+
+    it('createOmnichannelMessage with LiveChatV2 message without type should default contentType to empty string', () => {
+        const sampleMessage = {
+            id: 'id',
+            content: 'content',
+            metadata: { tags: 'tags' },
+            sender: {
+                communicationUserId: 'id',
+                kind: "communicationUser"
+            },
+            senderDisplayName: 'senderDisplayName',
+            createdOn: 'createdOn'
+        };
+
+        const omnichannelMessage = createOmnichannelMessage(sampleMessage as any, {
+            liveChatVersion: LiveChatVersion.V2
+        });
+
+        expect(omnichannelMessage.contentType).toBe('');
+    });
+
     it('createOmnichannelMessage with LiveChatV2 messaging contracts with \'OriginalMessageId\' should return OmnichannelMessage contracts', () => {
         const amsReferences = ['id'];
         const amsMetadata = [{fileName: 'fileName.ext', size: 0, contentType: 'type'}]
@@ -298,6 +406,110 @@ describe('createOmnichannelMessage', () => {
 
         if (omnichannelMessage.properties) {
             expect(omnichannelMessage.properties.originalMessageId).toEqual(sampleMessage.metadata.OriginalMessageId);
+        }
+    });
+
+    it('createOmnichannelMessage with LiveChatV2 message should not throw when sender is undefined', () => {
+        const sampleMessage = {
+            id: 'id',
+            content: 'content',
+            metadata: {
+                tags: 'tags',
+            },
+            senderDisplayName: 'senderDisplayName',
+            createdOn: 'createdOn'
+            // sender intentionally omitted (undefined)
+        };
+
+        let omnichannelMessage: any;
+        expect(() => {
+            omnichannelMessage = createOmnichannelMessage(sampleMessage as any, {
+                liveChatVersion: LiveChatVersion.V2
+            });
+        }).not.toThrow();
+
+        expect(omnichannelMessage.sender).toEqual({
+            id: undefined,
+            displayName: sampleMessage.senderDisplayName,
+            type: PersonType.Bot
+        });
+        expect(omnichannelMessage.content).toBe(sampleMessage.content);
+    });
+
+    it('createOmnichannelMessage with LiveChatV2 message should not throw when sender is null', () => {
+        const sampleMessage = {
+            id: 'id',
+            content: 'content',
+            metadata: {
+                tags: 'tags',
+            },
+            sender: null,
+            senderDisplayName: 'senderDisplayName',
+            createdOn: 'createdOn'
+        };
+
+        let omnichannelMessage: any;
+        expect(() => {
+            omnichannelMessage = createOmnichannelMessage(sampleMessage as any, {
+                liveChatVersion: LiveChatVersion.V2
+            });
+        }).not.toThrow();
+
+        expect(omnichannelMessage.sender).toEqual({
+            id: undefined,
+            displayName: sampleMessage.senderDisplayName,
+            type: PersonType.Bot
+        });
+    });
+
+    it('createOmnichannelMessage with LiveChatV2 message should emit a debug warning when sender is missing and debug is enabled', () => {
+        const sampleMessage = {
+            id: 'id',
+            content: 'content',
+            metadata: {
+                tags: 'tags',
+            },
+            sender: null,
+            senderDisplayName: 'senderDisplayName',
+            createdOn: 'createdOn'
+        };
+
+        const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+        try {
+            createOmnichannelMessage(sampleMessage as any, {
+                liveChatVersion: LiveChatVersion.V2,
+                debug: true
+            });
+
+            expect(consoleWarnSpy).toHaveBeenCalledWith(expect.stringContaining('has no sender'));
+        } finally {
+            consoleWarnSpy.mockRestore();
+        }
+    });
+
+    it('createOmnichannelMessage with LiveChatV2 message should not emit a debug warning when sender is missing and debug is disabled', () => {
+        const sampleMessage = {
+            id: 'id',
+            content: 'content',
+            metadata: {
+                tags: 'tags',
+            },
+            sender: null,
+            senderDisplayName: 'senderDisplayName',
+            createdOn: 'createdOn'
+        };
+
+        const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+        try {
+            createOmnichannelMessage(sampleMessage as any, {
+                liveChatVersion: LiveChatVersion.V2
+            });
+
+            expect(consoleWarnSpy).not.toHaveBeenCalled();
+        } finally {
+            consoleWarnSpy.mockRestore();
         }
     });
 });

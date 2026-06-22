@@ -12,6 +12,7 @@ import { createACSAdapter, createDirectLine, createIC3Adapter } from "./utils/ch
 import { createCoreServicesOrgUrl, getCoreServicesGeoName, isCoreServicesOrgUrl, unqOrgUrlPattern } from "./utils/CoreServicesUtils";
 import { defaultLocaleId, getLocaleStringFromId } from "./utils/locale";
 import exceptionThrowers, { throwAMSLoadFailure } from "./utils/exceptionThrowers";
+import { classifyNetworkError } from "./utils/errorClassifier";
 import { getRuntimeId, isClientIdNotFoundErrorMessage, isCustomerMessage } from "./utils/utilities";
 import { loadScript, removeElementById, sleep } from "./utils/WebUtils";
 import { retrieveRegionBasedUrl, shouldUseFramedMode } from "./utils/AMSClientUtils";
@@ -83,7 +84,9 @@ import OmnichannelChatToken from "@microsoft/omnichannel-amsclient/lib/Omnichann
 import OmnichannelConfig from "./core/OmnichannelConfig";
 import OmnichannelErrorCodes from "./core/OmnichannelErrorCodes";
 import OmnichannelMessage from "./core/messaging/OmnichannelMessage";
+import OmnichannelStreamingMessage from "./core/messaging/OmnichannelStreamingMessage";
 import OnNewMessageOptionalParams from "./core/messaging/OnNewMessageOptionalParams";
+import OnStreamingMessageOptionalParams from "./core/messaging/OnStreamingMessageOptionalParams";
 import PersonType from "@microsoft/omnichannel-ic3core/lib/model/PersonType";
 import PluggableLogger from "@microsoft/omnichannel-amsclient/lib/PluggableLogger";
 import PostChatContext from "./core/PostChatContext";
@@ -469,7 +472,11 @@ class OmnichannelChatSDK {
             const { getLiveChatConfigOptionalParams } = optionalParams;
             await this.getChatConfig(getLiveChatConfigOptionalParams || {});
         } catch (e) {
-            exceptionThrowers.throwChatConfigRetrievalFailure(e, this.scenarioMarker, TelemetryEvent.InitializeChatSDK);
+            // Extract elapsed time attached by getChatConfig
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const clientElapsedMs = (e as any).__chatConfigElapsedMs;
+            const diagnosticData = this.createGetChatConfigDiagnosticData(e, clientElapsedMs);
+            exceptionThrowers.throwChatConfigRetrievalFailure(e, this.scenarioMarker, TelemetryEvent.InitializeChatSDK, diagnosticData);
         }
 
         const supportedLiveChatVersions = [LiveChatVersion.V1, LiveChatVersion.V2];
@@ -544,7 +551,11 @@ class OmnichannelChatSDK {
             await this.getChatConfig(getLiveChatConfigOptionalParams || {});
             // once we have the config, we can check if we need to load AMS
         } catch (e) {
-            exceptionThrowers.throwChatConfigRetrievalFailure(e, this.scenarioMarker, TelemetryEvent.InitializeLoadChatConfig);
+            // Extract elapsed time attached by getChatConfig
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const clientElapsedMs = (e as any).__chatConfigElapsedMs;
+            const diagnosticData = this.createGetChatConfigDiagnosticData(e, clientElapsedMs);
+            exceptionThrowers.throwChatConfigRetrievalFailure(e, this.scenarioMarker, TelemetryEvent.InitializeLoadChatConfig, diagnosticData);
         }
 
         this.scenarioMarker.completeScenario(TelemetryEvent.InitializeLoadChatConfig);
@@ -1724,10 +1735,31 @@ class OmnichannelChatSDK {
                     console.log("[OmnichannelChatSDK][onNewMessage] New message received", event);
                     console.log("[OmnichannelChatSDK][onNewMessage] isChatMessageEditedEvent=>", isChatMessageEditedEvent);
 
-                    const omnichannelMessage = createOmnichannelMessage(event, {
-                        liveChatVersion: this.liveChatVersion,
-                        debug: (this.detailedDebugEnabled ? this.debugACS : this.debug),
-                    });
+                    // Guard message transformation: createOmnichannelMessage() can throw
+                    // (e.g. unexpected event shape). Without this, the throw became an
+                    // unhandled rejection in the WebSocket callback, breaking the callback
+                    // chain so the customer's onNewMessage never fired. Record telemetry
+                    // and skip the bad message instead of letting it break reception.
+                    //
+                    // Use singleRecord (fire-and-forget) rather than failScenario: by the
+                    // time this callback fires for an incoming message, the OnNewMessage
+                    // scenario has already been completed (and removed from the telemetry
+                    // map) further below, so failScenario would short-circuit on its
+                    // "event has not started" guard and never emit.
+                    let omnichannelMessage;
+                    try {
+                        omnichannelMessage = createOmnichannelMessage(event, {
+                            liveChatVersion: this.liveChatVersion,
+                            debug: (this.detailedDebugEnabled ? this.debugACS : this.debug),
+                        });
+                    } catch (error) {
+                        this.scenarioMarker.singleRecord(TelemetryEvent.OnNewMessage, {
+                            RequestId: this.requestId,
+                            ChatId: this.chatToken.chatId as string,
+                            ExceptionDetails: JSON.stringify({ errorObject: `${error}` })
+                        });
+                        return;
+                    }
 
                     // send callback for new messages or edited existent messages
                     if (!postedMessages.has(id) || isChatMessageEditedEvent) {
@@ -1789,6 +1821,94 @@ class OmnichannelChatSDK {
         }
     }
 
+    /**
+     * Fetches unread message count for the authenticated user.
+     * Auth-only — does not require an active chat session.
+     */
+    public async getUnreadMessageCount(): Promise<object> {
+        const telemetryData = {
+            RequestId: this.requestId || ""
+        };
+
+        this.scenarioMarker.startScenario(TelemetryEvent.GetUnreadMessageCount, telemetryData);
+
+        if (!this.authenticatedUserToken) {
+            exceptionThrowers.throwChatSDKError(
+                ChatSDKErrorName.UndefinedAuthToken,
+                undefined,
+                this.scenarioMarker,
+                TelemetryEvent.GetUnreadMessageCount,
+                telemetryData,
+                "getUnreadMessageCount is only supported for authenticated chats"
+            );
+        }
+
+        try {
+            const result = await this.OCClient.getUnreadMessageCount(this.authenticatedUserToken);
+
+            this.scenarioMarker.completeScenario(TelemetryEvent.GetUnreadMessageCount, telemetryData);
+            return result;
+        } catch (error) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const statusCode = (error as any)?.response?.status;
+            if (statusCode === 404) {
+                exceptionThrowers.throwChatSDKError(ChatSDKErrorName.InvalidConversation, error, this.scenarioMarker, TelemetryEvent.GetUnreadMessageCount, telemetryData, "Conversation not found");
+            }
+            exceptionThrowers.throwUnreadMessageCountRetrievalFailure(error, this.scenarioMarker, TelemetryEvent.GetUnreadMessageCount, telemetryData);
+        }
+
+        // Unreachable — throwUnreadMessageCountRetrievalFailure always throws.
+        // Required for TypeScript return type satisfaction.
+        return {};
+    }
+
+    /**
+     * Sends a read receipt for a specific message.
+     * Authenticated: calls MRT (updates NRD + forwards to ACS).
+     * Unauthenticated: calls ACS directly.
+     */
+    public async sendReadReceipt(messageId: string): Promise<void> {
+        const telemetryData = {
+            RequestId: this.requestId,
+            ChatId: this.chatToken?.chatId as string || ""
+        };
+
+        this.scenarioMarker.startScenario(TelemetryEvent.SendReadReceipt, telemetryData);
+
+        if (!this.isInitialized) {
+            exceptionThrowers.throwUninitializedChatSDK(this.scenarioMarker, TelemetryEvent.SendReadReceipt);
+        }
+
+        if (!messageId) {
+            exceptionThrowers.throwSendReadReceiptInvalidParams(this.scenarioMarker, TelemetryEvent.SendReadReceipt, telemetryData);
+        }
+
+        try {
+            if (this.authenticatedUserToken) {
+                // Authenticated: call MRT which updates NRD and forwards to ACS
+                await this.OCClient.sendReadReceipt(this.requestId, messageId, this.authenticatedUserToken);
+            } else {
+                // Unauthenticated: call ACS directly (no MRT, no NRD)
+                if (!this.conversation) {
+                    exceptionThrowers.throwUninitializedChatSDK(this.scenarioMarker, TelemetryEvent.SendReadReceipt);
+                }
+                await (this.conversation as ACSConversation).sendReadReceipt(messageId);
+            }
+
+            this.scenarioMarker.completeScenario(TelemetryEvent.SendReadReceipt, telemetryData);
+        } catch (error) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const statusCode = (error as any)?.response?.status;
+            if (statusCode === 404) {
+                exceptionThrowers.throwChatSDKError(ChatSDKErrorName.InvalidConversation, error, this.scenarioMarker, TelemetryEvent.SendReadReceipt, telemetryData, "Conversation not found");
+            }
+            if (statusCode === 400) {
+                exceptionThrowers.throwChatSDKError(ChatSDKErrorName.SendReadReceiptInvalidParams, error, this.scenarioMarker, TelemetryEvent.SendReadReceipt, telemetryData, "Invalid parameters");
+            }
+            exceptionThrowers.throwSendReadReceiptFailure(error, this.scenarioMarker, TelemetryEvent.SendReadReceipt, telemetryData);
+        }
+    }
+
     public async onTypingEvent(onTypingEventCallback: CallableFunction): Promise<void> {
         this.scenarioMarker.startScenario(TelemetryEvent.OnTypingEvent, {
             RequestId: this.requestId,
@@ -1838,6 +1958,72 @@ class OmnichannelChatSDK {
                     ChatId: this.chatToken.chatId as string
                 });
             }
+        }
+    }
+
+    /**
+     * Subscribes to ACS-driven streaming message chunks for progressive bot message rendering.
+     * Each chunk contains the full assembled text so far (not just the delta).
+     * Existing onNewMessage consumers continue receiving final messages without changes.
+     *
+     * Available only in LiveChatVersion.V2. Must call startChat() before registering.
+     *
+     * @param onStreamingMessageCallback - Called for each streaming chunk
+     * @param optionalParams - Reserved for future configuration
+     * @example
+     * chatSDK.onStreamingMessage((message) => {
+     *     switch (message.streamingMetadata.streamingMessageType) {
+     *         case "streaming": // Update bubble with message.content
+     *         case "final":     // Stream complete
+     *     }
+     * });
+     */
+    public async onStreamingMessage(
+        onStreamingMessageCallback: (message: OmnichannelStreamingMessage) => void,
+        optionalParams?: OnStreamingMessageOptionalParams
+    ): Promise<void> {
+        this.scenarioMarker.startScenario(TelemetryEvent.OnStreamingMessage, {
+            RequestId: this.requestId,
+            ChatId: this.chatToken?.chatId as string ?? ""
+        });
+
+        if (!this.isInitialized) {
+            exceptionThrowers.throwUninitializedChatSDK(this.scenarioMarker, TelemetryEvent.OnStreamingMessage);
+        }
+
+        try {
+            if (this.liveChatVersion !== LiveChatVersion.V2) {
+                throw new ChatSDKError(ChatSDKErrorName.UnsupportedLiveChatVersion);
+            }
+            if (!this.conversation) {
+                throw new ChatSDKError(ChatSDKErrorName.UninitializedConversation);
+            }
+
+            await (this.conversation as ACSConversation).registerOnStreamingMessage(
+                onStreamingMessageCallback,
+                optionalParams
+            );
+
+            this.scenarioMarker.completeScenario(TelemetryEvent.OnStreamingMessage, {
+                RequestId: this.requestId,
+                ChatId: this.chatToken?.chatId as string ?? ""
+            });
+        } catch (error) {
+            const wrappedError = (error instanceof ChatSDKError)
+                ? error
+                : new ChatSDKError(
+                    ChatSDKErrorName.StreamingSubscriptionFailure,
+                    undefined,
+                    { response: 'StreamingSubscriptionFailure', errorObject: `${error}` }
+                );
+
+            this.scenarioMarker.failScenario(TelemetryEvent.OnStreamingMessage, {
+                RequestId: this.requestId,
+                ChatId: this.chatToken?.chatId as string ?? "",
+                ExceptionDetails: JSON.stringify(wrappedError.exceptionDetails ?? wrappedError.message)
+            });
+
+            throw wrappedError;
         }
     }
 
@@ -2673,6 +2859,24 @@ class OmnichannelChatSDK {
             requestOptionalParams.initContext = optionalParams.initContext;
         }
 
+        // Forward the widget's streaming-capability signal to the server via customContextData
+        // pass-through. Only inject when the caller explicitly provided the flag — omitting it
+        // preserves the legacy contract (server sees no signal → non-streaming behavior).
+        // The {value, isDisplayable} wrapper is the customContextData variable contract;
+        // isDisplayable: false marks this as an internal capability signal, not for agent UI.
+        // NOTE: This runs AFTER the initContext override to ensure the flag survives even when
+        // the consumer provides their own initContext.
+        const supportsLcwStreaming = (optionalParams as StartChatOptionalParams)?.supportsLcwStreaming;
+        if (supportsLcwStreaming !== undefined) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const ctx = ((requestOptionalParams.initContext! as any).customContextData ?? {}) as any;
+            ctx.supportsLcwStreaming = {
+                value: supportsLcwStreaming ? "true" : "false",
+                isDisplayable: false
+            };
+            (requestOptionalParams.initContext! as any).customContextData = ctx; // eslint-disable-line @typescript-eslint/no-explicit-any
+        }
+
         if (this.authenticatedUserToken) {
             requestOptionalParams.authenticatedUserToken = this.authenticatedUserToken;
         }
@@ -2844,11 +3048,29 @@ class OmnichannelChatSDK {
         }
     }
 
+    /**
+     * Creates diagnostic data for getChatConfig errors using the error classifier
+     * @param e The error object
+     * @param clientElapsedMs Optional elapsed time in milliseconds from client's perspective
+     * @returns Diagnostic data with clientElapsedMs, online status, and cancellation reason
+     */
+    private createGetChatConfigDiagnosticData(e: unknown, clientElapsedMs?: number): { clientElapsedMs?: number; online?: boolean; cancellationReason: string } {
+        const online = typeof navigator !== 'undefined' && 'onLine' in navigator ? navigator.onLine : undefined;
+        const cancellationReason = classifyNetworkError(e, online);
+
+        return {
+            clientElapsedMs,
+            online,
+            cancellationReason
+        };
+    }
+
     private async getChatConfig(optionalParams: GetLiveChatConfigOptionalParams = {}): Promise<ChatConfig> {
         const { sendCacheHeaders } = optionalParams;
         const bypassCache = sendCacheHeaders === true;
 
         let liveChatConfig;
+        const startTime = typeof performance !== 'undefined' ? performance.now() : undefined;
 
         try {
 
@@ -2861,6 +3083,15 @@ class OmnichannelChatSDK {
             return this.liveChatConfig;
 
         } catch (error) {
+            // Calculate elapsed time locally to avoid concurrency issues
+            const clientElapsedMs = startTime !== undefined
+                ? Math.round(performance.now() - startTime)
+                : undefined;
+
+            // Attach timing info to error object for outer catch blocks to use
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (error as any).__chatConfigElapsedMs = clientElapsedMs;
+
             // Fallback on orgUrl which got converted to Core Services orgUrl
             if (isCoreServicesOrgUrlDNSError(error, this.coreServicesOrgUrl, this.dynamicsLocationCode)) {
                 this.omnichannelConfig.orgUrl = this.unqServicesOrgUrl as string;

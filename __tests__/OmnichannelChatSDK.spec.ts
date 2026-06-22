@@ -3782,6 +3782,58 @@ describe('Omnichannel Chat SDK, Sequential', () => {
             expect(chatSDK.conversation.registerOnNewMessage).toHaveBeenCalledTimes(1);
         });
 
+        it('ChatSDK.onNewMessage() WebSocket callback should log failScenario and not break the chain when createOmnichannelMessage throws', async () => {
+            const chatSDK = new OmnichannelChatSDK(omnichannelConfig);
+            chatSDK.getChatConfig = jest.fn();
+            chatSDK.getChatToken = jest.fn();
+            chatSDK["isAMSClientAllowed"] = true;
+
+            await chatSDK.initialize();
+
+            chatSDK.OCClient = {
+                sessionInit: jest.fn(),
+                createConversation: jest.fn()
+            }
+
+            chatSDK.AMSClient = {
+                initialize: jest.fn()
+            }
+
+            let registeredCallback: any;
+            jest.spyOn(chatSDK.ACSClient, 'initialize').mockResolvedValue(Promise.resolve());
+            jest.spyOn(chatSDK.ACSClient, 'joinConversation').mockResolvedValue(Promise.resolve({
+                registerOnNewMessage: jest.fn((cb: any) => { registeredCallback = cb; })
+            }));
+
+            await chatSDK.startChat();
+
+            // Force the V2 transformation path; an event whose `metadata.tags` is a
+            // non-string makes createOmnichannelMessage throw (`.replace is not a
+            // function`) during transformation — the documented failure for this bug.
+            chatSDK.liveChatVersion = LiveChatVersion.V2;
+            // Spy on singleRecord (fire-and-forget): failScenario can't be used here
+            // because the OnNewMessage scenario is already completed by the time the
+            // callback fires, so it would short-circuit on its "not started" guard.
+            jest.spyOn(chatSDK.scenarioMarker, 'singleRecord');
+            jest.spyOn(chatSDK.scenarioMarker, 'failScenario');
+
+            const customerCallback = jest.fn();
+            await chatSDK.onNewMessage(customerCallback);
+
+            expect(registeredCallback).toBeDefined();
+
+            const badEvent = { id: 'id', content: 'content', metadata: { tags: 12345 } };
+
+            // The wrapper must swallow the transformation error (no throw out of the callback)
+            expect(() => registeredCallback(badEvent)).not.toThrow();
+
+            // Telemetry is recorded via singleRecord (which always emits) and the
+            // customer callback is not invoked with a bad message
+            const singleRecordCall = chatSDK.scenarioMarker.singleRecord.mock.calls.find((c: any) => c[0] === 'OnNewMessage' && c[1] && c[1].ExceptionDetails);
+            expect(singleRecordCall).toBeDefined();
+            expect(customerCallback).not.toHaveBeenCalled();
+        });
+
         it('ChatSDK.onNewMessage() with disablePolling flag should pass it to conversation.registerOnNewMessage()', async () => {
             const chatSDK = new OmnichannelChatSDK(omnichannelConfig);
             chatSDK.getChatConfig = jest.fn();
@@ -6032,6 +6084,174 @@ describe('Omnichannel Chat SDK, Sequential', () => {
 
                 // Token should be updated to second authentication
                 expect(chatSDK.authenticatedUserToken).toBe('token-2');
+            });
+        });
+    });
+
+    describe('Read Receipts', () => {
+        describe('getUnreadMessageCount', () => {
+            it('ChatSDK.getUnreadMessageCount() should call OCClient.getUnreadMessageCount()', async () => {
+                const chatSDK = new OmnichannelChatSDK(omnichannelConfigGlobal);
+                chatSDK.getChatConfig = jest.fn();
+
+                await chatSDK.initialize();
+
+                chatSDK.authenticatedUserToken = 'validToken';
+                chatSDK.OCClient = {
+                    getUnreadMessageCount: jest.fn().mockResolvedValue({ unreadMessageCount: 3, mostRecentUnreadMessage: null })
+                };
+
+                const result = await chatSDK.getUnreadMessageCount();
+                expect(chatSDK.OCClient.getUnreadMessageCount).toHaveBeenCalledWith('validToken');
+                expect(result).toEqual({ unreadMessageCount: 3, mostRecentUnreadMessage: null });
+            });
+
+            it('ChatSDK.getUnreadMessageCount() should throw UndefinedAuthToken when no auth token', async () => {
+                const chatSDK = new OmnichannelChatSDK(omnichannelConfigGlobal);
+                chatSDK.getChatConfig = jest.fn();
+
+                await chatSDK.initialize();
+
+                chatSDK.authenticatedUserToken = null;
+
+                try {
+                    await chatSDK.getUnreadMessageCount();
+                    fail('Should have thrown');
+                } catch (error) {
+                    expect(error).toBeInstanceOf(ChatSDKError);
+                    expect((error as ChatSDKError).message).toBe(ChatSDKErrorName.UndefinedAuthToken);
+                }
+            });
+
+            it('ChatSDK.getUnreadMessageCount() should throw InvalidConversation on 404', async () => {
+                const chatSDK = new OmnichannelChatSDK(omnichannelConfigGlobal);
+                chatSDK.getChatConfig = jest.fn();
+
+                await chatSDK.initialize();
+
+                chatSDK.authenticatedUserToken = 'validToken';
+                const axiosError = new Error('Not Found');
+                (axiosError as any).isAxiosError = true;
+                (axiosError as any).response = { status: 404 };
+                chatSDK.OCClient = {
+                    getUnreadMessageCount: jest.fn().mockRejectedValue(axiosError)
+                };
+
+                try {
+                    await chatSDK.getUnreadMessageCount();
+                    fail('Should have thrown');
+                } catch (error) {
+                    expect(error).toBeInstanceOf(ChatSDKError);
+                    expect((error as ChatSDKError).message).toBe(ChatSDKErrorName.InvalidConversation);
+                }
+            });
+        });
+
+        describe('sendReadReceipt', () => {
+            it('ChatSDK.sendReadReceipt() should call OCClient.sendReadReceipt() for authenticated chat', async () => {
+                const chatSDK = new OmnichannelChatSDK(omnichannelConfigGlobal);
+                chatSDK.getChatConfig = jest.fn();
+                chatSDK.getChatToken = jest.fn();
+
+                await chatSDK.initialize();
+
+                chatSDK.OCClient = {
+                    sessionInit: jest.fn(),
+                    createConversation: jest.fn(),
+                    sendReadReceipt: jest.fn().mockResolvedValue(undefined)
+                };
+
+                chatSDK.AMSClient = {
+                    initialize: jest.fn()
+                };
+
+                jest.spyOn(chatSDK.ACSClient, 'initialize').mockResolvedValue(Promise.resolve());
+                jest.spyOn(chatSDK.ACSClient, 'joinConversation').mockResolvedValue(Promise.resolve({
+                    sendReadReceipt: jest.fn()
+                }));
+
+                await chatSDK.startChat();
+
+                chatSDK.authenticatedUserToken = 'validToken';
+                chatSDK.requestId = 'test-request-id';
+
+                await chatSDK.sendReadReceipt('1777185788167');
+                expect(chatSDK.OCClient.sendReadReceipt).toHaveBeenCalledWith('test-request-id', '1777185788167', 'validToken');
+            });
+
+            it('ChatSDK.sendReadReceipt() should call ACS directly for unauthenticated chat', async () => {
+                const chatSDK = new OmnichannelChatSDK(omnichannelConfigGlobal);
+                chatSDK.getChatConfig = jest.fn();
+                chatSDK.getChatToken = jest.fn();
+
+                await chatSDK.initialize();
+
+                chatSDK.OCClient = {
+                    sessionInit: jest.fn(),
+                    createConversation: jest.fn()
+                };
+
+                chatSDK.AMSClient = {
+                    initialize: jest.fn()
+                };
+
+                const mockSendReadReceipt = jest.fn().mockResolvedValue(undefined);
+                jest.spyOn(chatSDK.ACSClient, 'initialize').mockResolvedValue(Promise.resolve());
+                jest.spyOn(chatSDK.ACSClient, 'joinConversation').mockResolvedValue(Promise.resolve({
+                    sendReadReceipt: mockSendReadReceipt
+                }));
+
+                await chatSDK.startChat();
+
+                chatSDK.authenticatedUserToken = null;
+
+                await chatSDK.sendReadReceipt('1777185788167');
+                expect(mockSendReadReceipt).toHaveBeenCalledWith('1777185788167');
+            });
+
+            it('ChatSDK.sendReadReceipt() should throw SendReadReceiptInvalidParams when messageId is empty', async () => {
+                const chatSDK = new OmnichannelChatSDK(omnichannelConfigGlobal);
+                chatSDK.getChatConfig = jest.fn();
+                chatSDK.getChatToken = jest.fn();
+
+                await chatSDK.initialize();
+
+                chatSDK.OCClient = {
+                    sessionInit: jest.fn(),
+                    createConversation: jest.fn()
+                };
+
+                chatSDK.AMSClient = {
+                    initialize: jest.fn()
+                };
+
+                jest.spyOn(chatSDK.ACSClient, 'initialize').mockResolvedValue(Promise.resolve());
+                jest.spyOn(chatSDK.ACSClient, 'joinConversation').mockResolvedValue(Promise.resolve({}));
+
+                await chatSDK.startChat();
+
+                try {
+                    await chatSDK.sendReadReceipt('');
+                    fail('Should have thrown');
+                } catch (error) {
+                    expect(error).toBeInstanceOf(ChatSDKError);
+                    expect((error as ChatSDKError).message).toBe(ChatSDKErrorName.SendReadReceiptInvalidParams);
+                }
+            });
+
+            it('ChatSDK.sendReadReceipt() should throw UninitializedChatSDK when not initialized', async () => {
+                const chatSDK = new OmnichannelChatSDK(omnichannelConfigGlobal);
+                chatSDK.getChatConfig = jest.fn();
+
+                // Do NOT call initialize() — isInitialized remains false
+
+                try {
+                    await chatSDK.sendReadReceipt('1777185788167');
+                    fail('Should have thrown');
+                } catch (error) {
+                    expect(error).toBeInstanceOf(ChatSDKError);
+                    expect((error as ChatSDKError).message).toBe(ChatSDKErrorName.UninitializedChatSDK);
+                }
             });
         });
     });

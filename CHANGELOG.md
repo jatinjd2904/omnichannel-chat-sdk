@@ -6,12 +6,38 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added `onStreamingMessage` public API for progressive bot message rendering via ACS streaming
+- Added `OmnichannelStreamingMessage`, `StreamingMetadata`, `PolicyViolation`, `OnStreamingMessageOptionalParams` exported types
+- Added streaming message telemetry events: `StreamingMessageReceived`, `StreamingDuplicateFinal`, `StreamingChunkNoContent`, `StreamingChunkAfterFinal`, `StreamingPolicyViolation`, `StreamingMetadataMissingType`, `StreamingFinalMissingReason`, `StreamingCounterEvicted`, `StreamingHandlerThrew`, `StreamingHandlerAsyncRejected`
+- Added `StreamingMessagePrinter` for structured telemetry logging of streaming events
+- Added duplicate final detection and LRU-bounded sequence counter management in `createOmnichannelStreamingMessage`
+
+### Fixed
+
+- Fixed streaming final messages not delivered to `onStreamingMessage` when ACS sends them as `chatMessageReceived` (event 200) instead of `streamingChatMessageChunkReceived` (event 251)
+- Fixed `streamingMessageType` never being `"start"` — ACS sends `"streaming"` for start events; SDK now overrides to `"start"` based on event name
+- Backward compatibility: `onNewMessage` always fires for the final complete message alongside `onStreamingMessage`, ensuring existing consumers are unaffected
+
+### Added
+
+- Added `getUnreadMessageCount` public method to fetch unread message count for authenticated users (auth-only, pre-session badge use case)
+- Added `sendReadReceipt` public method to mark messages as read (authenticated: via MRT, unauthenticated: via ACS directly)
+- Added `sendReadReceipt` to `ACSClient` for direct ACS read receipt delivery (unauthenticated path)
+- Added `GetUnreadMessageCount` and `SendReadReceipt` telemetry events
+- Added `SendReadReceiptFailure`, `SendReadReceiptInvalidParams`, `UnreadMessageCountRetrievalFailure` to `ChatSDKErrorName` enum
+- Added throw helpers in `exceptionThrowers.ts` for read receipt error handling
+- HTTP error mapping: 404 → `InvalidConversation`, 400 → `SendReadReceiptInvalidParams`, others → retrieval/send failure
+
 - Added `authenticateChat` public method to authenticate an ongoing unauthenticated chat session mid-conversation
 - Added `MidConversationAuth` telemetry event for scenario tracking
 - Added `MidConversationAuthFailure` to `ChatSDKErrorName` enum
 - Added `deferInitialAuth` instance property to skip authentication during `startChat` for mid-auth flows
 - Uses structured `ChatSDKExceptionDetails` with `JSON.stringify` for all telemetry `ExceptionDetails`
 - Throws `ChatSDKError` consistently on all failure paths (token resolution, empty token, API call, token refresh)
+
+### Changed
+- Pinned `@microsoft/botframework-webchat-adapter-azure-communication-chat` to exact version `0.0.1-beta.8` (removed caret). The previous `^0.0.1-beta.6` range resolved (per semver §11) to the rogue prerelease `0.0.1-beta-1`, which ships an older adapter build whose 15s polling watchdog caused a ~15s delay before the first bot reply rendered in LCW. Pinning forces npm to install the intended `beta.8` build, which contains the fast-poll fix (`iteration <= 45 ? 1000 : delaytm`).
+- Updated botframework-webchat-adapter-azure-communication-chat to "^0.0.1-beta.6"
 
 ### Added
 
@@ -24,11 +50,17 @@ All notable changes to this project will be documented in this file.
 - Switch npm publishing to GitHub Actions OIDC trusted publishing (no NPM_TOKEN needed)
 - Dev versions now auto-publish on push to main (e.g. `1.11.9-main.abc1234`)
 - Add `hotfix/**` branch trigger to npm-release workflow
+- Publish a GitHub Release with the packed `.tgz` and auto-generated release notes whenever a `v*` tag is pushed (runs after the npm publish step in `npm-release.yml`)
 
 ### Fixed
+- Fix unhandled exception in the WebSocket `onNewMessage` callback wrapper in `OmnichannelChatSDK`. `createOmnichannelMessage()` was called without a try/catch, so a transformation error became an unhandled promise rejection that broke the callback chain and prevented the customer `onNewMessage` callback from firing for subsequent messages. The transformation is now wrapped in try/catch: failures are recorded via `scenarioMarker.singleRecord` (structured `ExceptionDetails`) and the bad message is skipped, keeping message reception alive
+- Fix silent error swallowing in the `ACSClient` polling path. Message-processing failures inside `registerOnNewMessage` were only logged to `console.warn`, so no error telemetry was emitted and production failures were invisible. The catch block now records a `MessageProcessingError` fail-scenario (with structured `ExceptionDetails`) via the logger while still continuing the polling loop
+- Fix null reference exception in `createOmnichannelMessage` when the ACS message `sender` is null/undefined (e.g. system messages or certain ACS event types); now reads `sender?.communicationUserId` so message transformation no longer throws and customer `onNewMessage` callbacks still fire
+- Fix V2 `onNewMessage` and `getMessages` losing the ACS message-type field. `createOmnichannelMessage` now propagates it as `contentType` on the returned `OmnichannelMessage` so receivers can render html-typed agent messages (e.g. from D365 Edge) instead of treating the raw HTML body as plain text. Field already existed on the interface; previously left empty. The WebSocket signaling event (`'Text'` / `'RichText/Html'`) and the REST rehydrate path (`'text'` / `'html'`) are normalized to a single lowercase `'text'` / `'html'` contract so consumers don't have to handle both spellings.
 - Fix `sendTypingEvent` failing silently for authenticated and persistent chat when `OCClient.sendTypingIndicator()` returns a `404`; changed to fire-and-forget so `ACSConversation.sendTyping()` always executes regardless of the OC indicator result
 
 - Fix npm publish failing for prerelease versions by adding `--tag latest` to publish command
+- Use `npx npm@11.12.1` for publish step to fix OIDC trusted publishing (npm 10.9.7 can't do OIDC, and `npm install -g` crashes during self-upgrade)
 
 - Fix `onAgentEndSession` callback incorrectly firing during customer-initiated `endChat()` by adding `isEndingChat` guard flag to suppress spurious ACS `participantsRemoved` events triggered by the disconnect cleanup
 - Fix `onAgentEndSession` callback not firing when agent ends the session due to a race condition where the backend conversation state has not yet transitioned from `Active` to `WrapUp`/`Closed` at the time the ACS `participantsRemoved` event arrives; added retry logic (3 attempts, 2s delay) to poll `getConversationDetails()` until the state catches up

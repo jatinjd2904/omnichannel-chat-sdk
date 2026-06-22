@@ -18,9 +18,10 @@ import ChatSDKExceptionDetails from "../core/ChatSDKExceptionDetails";
 import ScenarioMarker from "../telemetry/ScenarioMarker";
 import TelemetryEvent from "../telemetry/TelemetryEvent";
 
-export const throwChatSDKError = (chatSDKError: ChatSDKErrorName, e: unknown, scenarioMarker: ScenarioMarker, telemetryEvent: TelemetryEvent, telemetryData: { [key: string]: string } = {}, message?: string): void => {
+export const throwChatSDKError = (chatSDKError: ChatSDKErrorName, e: unknown, scenarioMarker: ScenarioMarker, telemetryEvent: TelemetryEvent, telemetryData: { [key: string]: string } = {}, message?: string, diagnosticData?: { clientElapsedMs?: number; cancellationReason?: string; online?: boolean }): void => {
     const exceptionDetails: ChatSDKExceptionDetails = {
-        response: chatSDKError
+        response: chatSDKError,
+        ...diagnosticData
     };
     if (e) {
         if (typeof e === "object" && e !== null && "response" in e) {
@@ -84,8 +85,8 @@ export const throwOmnichannelClientInitializationFailure = (e: unknown, scenario
     throwChatSDKError(ChatSDKErrorName.OmnichannelClientInitializationFailure, e, scenarioMarker, telemetryEvent);
 };
 
-export const throwChatConfigRetrievalFailure = (e: unknown, scenarioMarker: ScenarioMarker, telemetryEvent: TelemetryEvent): void => {
-    throwChatSDKError(ChatSDKErrorName.ChatConfigRetrievalFailure, e, scenarioMarker, telemetryEvent);
+export const throwChatConfigRetrievalFailure = (e: unknown, scenarioMarker: ScenarioMarker, telemetryEvent: TelemetryEvent, diagnosticData?: { clientElapsedMs?: number; cancellationReason?: string; online?: boolean }): void => {
+    throwChatSDKError(ChatSDKErrorName.ChatConfigRetrievalFailure, e, scenarioMarker, telemetryEvent, {}, undefined, diagnosticData);
 };
 
 export const throwUnsupportedLiveChatVersionFailure = (e: unknown, scenarioMarker: ScenarioMarker, telemetryEvent: TelemetryEvent): void => {
@@ -159,6 +160,19 @@ export const throwAuthContactIdNotFoundFailure = (e: unknown, scenarioMarker: Sc
     throwChatSDKError(ChatSDKErrorName.AuthContactIdNotFoundFailure, e, scenarioMarker, telemetryEvent, telemetryData);
 }
 
+export const throwSendReadReceiptFailure = (e: unknown, scenarioMarker: ScenarioMarker, telemetryEvent: TelemetryEvent, telemetryData: {[key: string]: string} = {}): void => {
+    throwChatSDKError(ChatSDKErrorName.SendReadReceiptFailure, e, scenarioMarker, telemetryEvent, telemetryData);
+};
+
+export const throwSendReadReceiptInvalidParams = (scenarioMarker: ScenarioMarker, telemetryEvent: TelemetryEvent, telemetryData: {[key: string]: string} = {}): void => {
+    const message = "messageId is required";
+    throwChatSDKError(ChatSDKErrorName.SendReadReceiptInvalidParams, undefined, scenarioMarker, telemetryEvent, telemetryData, message);
+};
+
+export const throwUnreadMessageCountRetrievalFailure = (e: unknown, scenarioMarker: ScenarioMarker, telemetryEvent: TelemetryEvent, telemetryData: {[key: string]: string} = {}): void => {
+    throwChatSDKError(ChatSDKErrorName.UnreadMessageCountRetrievalFailure, e, scenarioMarker, telemetryEvent, telemetryData);
+};
+
 export default {
     throwChatSDKError,
     throwScriptLoadFailure,
@@ -182,5 +196,8 @@ export default {
     throwChatAdapterInitializationFailure,
     throwLiveChatTranscriptRetrievalFailure,
     throwAuthContactIdNotFoundFailure,
-    throwNotPersistentChatEnabled
+    throwNotPersistentChatEnabled,
+    throwSendReadReceiptFailure,
+    throwSendReadReceiptInvalidParams,
+    throwUnreadMessageCountRetrievalFailure
 }

@@ -66,7 +66,17 @@ export enum ChatSDKErrorName {
     AuthenticatedUserTokenNotFound = "AuthenticatedUserTokenNotFound",
     /** Failure in mid-conversation authentication */
     MidConversationAuthFailure = "MidConversationAuthFailure",
+    /** Failure in sending read receipt */
+    SendReadReceiptFailure = "SendReadReceiptFailure",
+    /** Invalid parameters for send read receipt (missing messageId) */
+    SendReadReceiptInvalidParams = "SendReadReceiptInvalidParams",
+    /** Failure in retrieving unread message count */
+    UnreadMessageCountRetrievalFailure = "UnreadMessageCountRetrievalFailure",
 
+    /** Streaming requires an active conversation; called before startChat() */
+    UninitializedConversation = "UninitializedConversation",
+    /** Failure to subscribe to ACS streaming events */
+    StreamingSubscriptionFailure = "StreamingSubscriptionFailure",
 }
 
 export class ChatSDKError {
